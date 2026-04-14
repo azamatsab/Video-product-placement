@@ -21,7 +21,8 @@ Output: /root/vpp/output/v2_composite/frames/*.png + v2_composite.mp4
 import os
 import json
 import numpy as np
-from PIL import Image, ImageFilter
+import cv2
+from PIL import Image, ImageFilter, ImageDraw
 import torch
 import torchvision.io as tvio
 
@@ -82,9 +83,12 @@ def find_table_top_anchor(table_mask):
         # fallback to bbox of full mask
         ys, xs = np.where(table_mask > 128)
     x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
-    # Anchor at centroid of top_only (tends to be middle of top surface)
+    # Anchor at centroid of top_only (tends to be middle of top surface).
+    # Small positive offset sits the base slightly toward the front so the
+    # product visibly rests on the surface; values in [0.00, 0.04] all look
+    # plausible — 0.02 is a safe middle.
     anchor_x = int(xs.mean())
-    anchor_y = int(ys.mean()) + int((y2 - y1) * 0.04)
+    anchor_y = int(ys.mean()) + int((y2 - y1) * 0.02)
     table_top_width = x2 - x1
     print(f"  table top bbox: ({x1},{y1})-({x2},{y2}), width: {table_top_width}")
     # save the cleaned mask for inspection
@@ -103,54 +107,85 @@ def main():
     anchor_canvas = frame_to_canvas(anchor_x, anchor_y, 0)
     print(f"Anchor (canvas): {anchor_canvas}")
 
-    # Load product
-    product = Image.open(PRODUCT_RGBA).convert("RGBA")
-    prod_w0, prod_h0 = product.size
+    # Load product at source resolution
+    product_pil = Image.open(PRODUCT_RGBA).convert("RGBA")
+    prod_w0, prod_h0 = product_pil.size
 
     # Target product width = 42 % of table top width in frame 0
     target_prod_w = int(table_w * 0.42)
     aspect = prod_h0 / prod_w0
     target_prod_h = int(target_prod_w * aspect)
-    product_base = product.resize((target_prod_w, target_prod_h), Image.LANCZOS)
-    print(f"Product base size: {product_base.size}")
+    print(f"Product base size (frame 0): {target_prod_w}x{target_prod_h}")
 
-    # Per-frame compositing
+    # Precompute product+shadow canvas ONCE at source resolution
+    # The canvas is a bit larger than the product to leave room for a soft shadow
+    # beneath the base. Everything is warped together per frame so shadow stays
+    # attached and subpixel-smooth.
+    pad_bottom = int(prod_h0 * 0.10)
+    pad_side = int(prod_w0 * 0.06)
+    canvas_w = prod_w0 + pad_side * 2
+    canvas_h = prod_h0 + pad_bottom
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    # Draw shadow first
+    shadow = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sh_cx = canvas_w / 2
+    sh_y1 = prod_h0 - 8
+    sh_y2 = prod_h0 + pad_bottom - 4
+    sh_rx = prod_w0 * 0.42
+    sd.ellipse((sh_cx - sh_rx, sh_y1, sh_cx + sh_rx, sh_y2), fill=(0, 0, 0, 140))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=10))
+    canvas.alpha_composite(shadow)
+    # Then product on top, centered horizontally, aligned to top of canvas
+    canvas.alpha_composite(product_pil, dest=(pad_side, 0))
+
+    # Convert to numpy BGRA for cv2
+    product_np = np.array(canvas)  # HWC RGBA
+    src_h, src_w = product_np.shape[:2]
+    print(f"Source canvas with shadow: {src_w}x{src_h}")
+
+    W, H = FRAME_SIZE
+
+    # Per-frame compositing via cv2.warpAffine (sub-pixel bilinear)
     placements = []
     for i in range(N_FRAMES):
         frame = Image.open(os.path.join(SOURCE_FRAMES, f"{i:04d}.png")).convert("RGB")
+        frame_np = np.array(frame)  # HWC RGB uint8
 
-        # Project anchor from canvas → this frame's coords
+        # Project anchor from canvas → this frame's coords (both floats)
         fx, fy = canvas_to_frame(anchor_canvas[0], anchor_canvas[1], i)
-        # Scale the product by the current zoom factor vs. frame 0 (slight grow)
+
+        # Scale factor: zoom ratio × (target_prod_w / prod_w0 at source resolution)
         _, _, _, ch_i = pan_zoom_params(i)
         _, _, _, ch_0 = pan_zoom_params(0)
-        zoom_ratio = ch_0 / ch_i  # ch shrinks as zoom in → ratio > 1
-        cur_w = int(target_prod_w * zoom_ratio)
-        cur_h = int(target_prod_h * zoom_ratio)
-        product_i = product.resize((cur_w, cur_h), Image.LANCZOS)
+        zoom_ratio = ch_0 / ch_i
+        s = (target_prod_w * zoom_ratio) / prod_w0
 
-        # paste: base centre at (fx, fy)
-        paste_x = int(fx - cur_w / 2)
-        paste_y = int(fy - cur_h)  # bottom of product at anchor
+        # We want the *base* of the product (which in source canvas is at
+        # y = prod_h0, x = canvas_w / 2) to land at (fx, fy) in the frame.
+        # Affine: x_dst = s * x_src + tx, y_dst = s * y_src + ty
+        # At base-center (canvas_w/2, prod_h0) → (fx, fy):
+        tx = fx - s * (canvas_w / 2)
+        ty = fy - s * prod_h0
 
-        # Drop shadow: darkened ellipse beneath the product
-        shadow = Image.new("RGBA", product_i.size, (0, 0, 0, 0))
-        from PIL import ImageDraw
-        sh_draw = ImageDraw.Draw(shadow)
-        sh_y1 = int(cur_h * 0.92)
-        sh_y2 = cur_h - 1
-        sh_draw.ellipse((int(cur_w * 0.08), sh_y1, int(cur_w * 0.92), sh_y2),
-                        fill=(0, 0, 0, 120))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=4))
+        M = np.array([[s, 0, tx],
+                      [0, s, ty]], dtype=np.float32)
+        warped = cv2.warpAffine(
+            product_np, M, (W, H),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+        # Alpha composite onto frame
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        rgb = warped[:, :, :3].astype(np.float32)
+        composed = frame_np.astype(np.float32) * (1 - alpha) + rgb * alpha
+        composed = composed.clip(0, 255).astype(np.uint8)
 
-        composite = frame.convert("RGBA")
-        composite.alpha_composite(shadow, dest=(paste_x, paste_y))
-        composite.alpha_composite(product_i, dest=(paste_x, paste_y))
-        composite.convert("RGB").save(os.path.join(OUT_FRAMES, f"{i:04d}.png"))
-
-        placements.append({"frame": i, "paste_xy": [paste_x, paste_y], "size": [cur_w, cur_h]})
+        Image.fromarray(composed).save(os.path.join(OUT_FRAMES, f"{i:04d}.png"))
+        placements.append({"frame": i, "fx": fx, "fy": fy, "scale": s})
         if (i + 1) % 8 == 0:
-            print(f"  {i+1}/{N_FRAMES} @ paste=({paste_x},{paste_y}) size=({cur_w}x{cur_h})")
+            print(f"  {i+1}/{N_FRAMES} @ fx={fx:.2f} fy={fy:.2f} scale={s:.4f}")
 
     with open(os.path.join(OUT, "placements.json"), "w") as f:
         json.dump(placements, f, indent=2)
