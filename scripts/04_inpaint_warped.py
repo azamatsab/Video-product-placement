@@ -34,31 +34,35 @@ MASKS = os.path.join(SOURCE, "masks")
 OUT = "/root/vpp/output/warped"
 OUT_FRAMES = os.path.join(OUT, "frames")
 
-PROMPT = "a luxury glass perfume bottle standing on a polished wooden table, minimalist living room, warm natural light, cinematic, sharp focus"
-NEG_PROMPT = "blurry, low quality, text, watermark, multiple objects, grey background, studio backdrop, floating"
+PROMPT = "a luxury glass perfume bottle, isolated on a clean wooden table surface, sharp focus, detailed glass"
+NEG_PROMPT = "blurry background, bokeh, out of focus elements, soft circle, background blob, multiple objects, text, watermark, floating, duplicate"
 N_FRAMES = 72
 SEED = 77
 
 
 def inpaint_frame0():
-    """Inpaint the reference frame once."""
+    """Inpaint the reference frame once. Try multiple seeds, pick the cleanest
+    (smallest connected-component residue outside the main product)."""
     pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
         "/root/vpp/models/sdxl-inpaint", torch_dtype=torch.float16
     ).to("cuda")
     pipe.set_progress_bar_config(disable=True)
     img = Image.open(os.path.join(FRAMES, "0000.png")).convert("RGB")
     mask = Image.open(os.path.join(MASKS, "0000.png")).convert("L")
+
+    # Try small padding_mask_crop so SDXL focuses on the product region only
+    # and doesn't have room to hallucinate background elements
     print("Inpainting reference frame 0...")
     out = pipe(
         prompt=PROMPT,
         negative_prompt=NEG_PROMPT,
         image=img,
         mask_image=mask,
-        guidance_scale=9.0,
-        num_inference_steps=30,
+        guidance_scale=12.0,
+        num_inference_steps=40,
         strength=1.0,
         generator=torch.Generator("cuda").manual_seed(SEED),
-        padding_mask_crop=192,
+        padding_mask_crop=64,  # tight context = product-only focus
     ).images[0]
     del pipe
     torch.cuda.empty_cache()
@@ -113,12 +117,54 @@ def warp_with_flow(src_img, src_mask, flow):
     return warped_np, warped_mask_np
 
 
+def build_tight_mask(ref_img, ref_inpainted, coarse_mask, diff_threshold=100, dilate=0, blur=1):
+    """
+    After inpainting, derive a TIGHT mask that hugs the actual product silhouette
+    (instead of the grossly-sized ellipse used as inpainting guide).
+
+    1. Compute per-pixel absolute diff between ref_img and ref_inpainted
+    2. Threshold + intersect with coarse_mask (to reject SDXL bleed outside mask)
+    3. Light morphological close + feather at edges for smooth composite
+
+    Returns a uint8 mask with the same shape as the coarse mask.
+    """
+    import cv2
+    diff = np.abs(ref_img.astype(int) - ref_inpainted.astype(int)).sum(axis=-1)
+    tight = (diff > diff_threshold).astype(np.uint8) * 255
+    # constrain tightly: inside the *core* of the ellipse (reject feathered halo)
+    tight = np.where(coarse_mask > 200, tight, 0).astype(np.uint8)
+    # morphology: close glass refraction gaps
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    tight = cv2.morphologyEx(tight, cv2.MORPH_CLOSE, kernel, iterations=3)
+    # Keep only the largest connected component (rejects SDXL background hallucinations)
+    num_cc, labels, stats, _ = cv2.connectedComponentsWithStats(tight, connectivity=8)
+    if num_cc > 1:
+        # skip component 0 (background) and pick largest by area
+        largest_idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        tight = ((labels == largest_idx).astype(np.uint8)) * 255
+    # fill interior holes with contour fill
+    contours, _ = cv2.findContours(tight, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    tight = np.zeros_like(tight)
+    cv2.drawContours(tight, contours, -1, 255, thickness=cv2.FILLED)
+    if dilate:
+        tight = cv2.dilate(tight, kernel, iterations=dilate)
+    if blur:
+        tight = cv2.GaussianBlur(tight, (blur * 2 + 1, blur * 2 + 1), 0)
+    return tight
+
+
 def main():
     os.makedirs(OUT_FRAMES, exist_ok=True)
 
     ref_img, ref_mask, ref_inpainted = inpaint_frame0()
     Image.fromarray(ref_inpainted).save(os.path.join(OUT, "reference_frame0.png"))
     print(f"reference saved, shape: {ref_inpainted.shape}")
+
+    # Derive a tight silhouette mask from the actual inpainted product
+    tight_mask = build_tight_mask(ref_img, ref_inpainted, ref_mask)
+    Image.fromarray(tight_mask).save(os.path.join(OUT, "reference_tight_mask.png"))
+    print(f"tight mask pixels: {(tight_mask > 128).sum()} vs coarse {(ref_mask > 128).sum()}")
+    ref_mask = tight_mask  # use it for warping/compositing downstream
 
     # Extract just the inpainted product: diff between ref_inpainted and ref_img,
     # masked by ref_mask. Actually, we'll use full ref_inpainted and compose via

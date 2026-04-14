@@ -24,11 +24,11 @@ MASKS = os.path.join(SOURCE, "masks")
 OUT = "/root/vpp/output/naive"
 OUT_FRAMES = os.path.join(OUT, "frames")
 
-PROMPT = "a luxury glass perfume bottle standing on a polished wooden table, minimalist living room, warm natural light, cinematic, sharp focus"
-NEG_PROMPT = "blurry, low quality, text, watermark, multiple objects, grey background, studio backdrop, floating"
+PROMPT = "a luxury glass perfume bottle, isolated on a clean wooden table surface, sharp focus, detailed glass"
+NEG_PROMPT = "blurry background, bokeh, out of focus elements, soft circle, background blob, multiple objects, text, watermark, floating, duplicate"
 SEED = 77
 N_FRAMES = 72
-INFERENCE_STEPS = 30
+INFERENCE_STEPS = 40
 
 
 def main():
@@ -53,11 +53,11 @@ def main():
             negative_prompt=NEG_PROMPT,
             image=img,
             mask_image=mask,
-            guidance_scale=9.0,
+            guidance_scale=12.0,
             num_inference_steps=INFERENCE_STEPS,
             strength=1.0,
             generator=gen,
-            padding_mask_crop=192,  # large context window around mask for scene-aware inpainting
+            padding_mask_crop=64,  # tight context — matches warped config for fair A/B
         ).images[0]
         out.save(os.path.join(OUT_FRAMES, f"{i:04d}.png"))
         if (i + 1) % 8 == 0:

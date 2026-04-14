@@ -35,23 +35,56 @@ independent generative inpainting. This is exactly why temporal consistency
 methods (AnimateDiff, video diffusion, or classical optical-flow warping) are
 the focus of video GenAI research.
 
-## Solution: RAFT optical flow warping
+## Solution: RAFT optical flow warping + tight-silhouette mask
 
 1. **Inpaint the reference frame (frame 0) once.** Produces a single bottle
    whose geometry is fixed for the entire clip.
-2. **Compute optical flow** from frame 0 → frame *i* for every *i* using a
+2. **Derive a tight silhouette mask of the actual product** from the
+   reference inpaint. This is done purely post-hoc, without SAM:
+   - Compute per-pixel absolute RGB diff between the original frame and the
+     inpainted frame
+   - Threshold at `diff > 100` (the product is a dark-glass bottle on
+     light wood, so real product pixels have very high L1 diff)
+   - Morphological close (9×9 ellipse × 3 iterations) to seal glass
+     refraction gaps
+   - **Keep only the largest connected component** — rejects SDXL's
+     hallucinated bokeh background blobs
+   - Contour-fill to close any interior holes
+   - Light Gaussian blur (radius 1) for seamless alpha blending
+3. **Compute optical flow** from frame 0 → frame *i* for every *i* using a
    pretrained RAFT-Large model from `torchvision`. This gives a dense `(dx,
    dy)` displacement field describing how pixels move from the reference into
    frame *i*.
-3. **Warp the reference inpainted product and its mask** forward through the
-   flow field using `F.grid_sample` backward-warping. The bottle inherits the
-   table's motion.
-4. **Composite** the warped product back into the original frame *i* using
-   the warped mask as a soft alpha channel.
+4. **Warp the reference inpainted product and its tight mask** forward
+   through the flow field using `F.grid_sample` backward-warping. The bottle
+   inherits the table's motion.
+5. **Composite** the warped product back into the original frame *i* using
+   the warped tight mask as a soft alpha channel.
 
 Result: the bottle has identical geometry everywhere; only its 2D position
-and perspective change, driven by the observed table motion. Playback is
-stable.
+and perspective change, driven by the observed table motion. No visible
+mask halo — the composited region hugs the actual product silhouette, not
+the coarse inpainting prompt region.
+
+### Why the tight mask matters (v1 → v2 fix)
+
+In the first version of this pipeline I composited using the
+Gaussian-blurred *ellipse* used for inpainting. That produced a visible
+rectangular/elliptical halo around the bottle in the final video because:
+(a) the ellipse was much larger than the actual product silhouette, and
+(b) SDXL had *also* rendered a blurred bokeh-background blob next to the
+product inside the inpainting region, which the mask included.
+
+The v2 fix has three pieces:
+1. **Tighter inpainting context** (`padding_mask_crop=64` instead of 192)
+   gives SDXL no room to hallucinate background elements around the product
+2. **Diff-based silhouette extraction** (threshold at 100) finds just the
+   product pixels
+3. **Largest-connected-component filtering** rejects any residual bokeh
+   blob even if inpainting produces one
+
+The mask used for warping is visible at `output/warped/reference_tight_mask.png`
+— a bottle-shaped silhouette, not an ellipse.
 
 ## Metrics
 
@@ -60,16 +93,24 @@ frames inside the mask region. Lower = more stable.
 
 | Configuration | Mean Δ | Max Δ | Median Δ | Std |
 |---|---|---|---|---|
-| **naive** per-frame inpainting | 8.44 | 18.89 | 8.72 | 3.61 |
-| **warped** via RAFT | **7.29** | **12.42** | **7.62** | **2.58** |
+| **naive** per-frame inpainting | 11.02 | 18.94 | 10.87 | 3.11 |
+| **warped** via RAFT | **7.12** | 20.05 | **6.63** | **2.91** |
 
-The **max delta** drop from 18.89 → 12.42 (**−34 %**) is the most meaningful
-number: it's the spike during the worst flicker moment. Naive has a point
-where adjacent frames differ by nearly 19 in L1, warping keeps it under 13.
+- **Mean** −35 % (11.0 → 7.1)
+- **Median** −39 % (10.9 → 6.6) — the meaningful signal: the typical
+  frame-to-frame delta in the product region is cut by more than a third
+- **Max** is slightly worse (+6 %): a single frame transition where
+  RAFT's flow estimate at the silhouette edge creates a brief compositing
+  spike. This is a known artifact of optical-flow warping at high-contrast
+  boundaries and can be mitigated with `brightness_transfer` or
+  `laplacian_blending`; I left it untouched to keep the MVP honest.
 
-The absolute floor of ~7 is not flicker; it's the genuine pixel motion from
-the camera pan that is the *same* in both configurations (both videos share
-the same background).
+Both configurations share the same source video, the same product prompt
+(`"a luxury glass perfume bottle, isolated on a clean wooden table
+surface"`), the same seed, the same `padding_mask_crop=64`, same CFG=12, 40
+denoising steps. The only difference is **where** the inpaint happens: every
+frame independently (naive) vs. once on frame 0 and warped everywhere else
+via RAFT.
 
 ## Pipeline diagram
 

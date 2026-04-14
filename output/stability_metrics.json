@@ -1,14 +1,14 @@
 {
   "naive": {
-    "mean_frame_delta": 8.441,
-    "max_frame_delta": 18.889,
-    "median_frame_delta": 8.717,
-    "std_frame_delta": 3.609
+    "mean_frame_delta": 11.016,
+    "max_frame_delta": 18.935,
+    "median_frame_delta": 10.871,
+    "std_frame_delta": 3.107
   },
   "warped": {
-    "mean_frame_delta": 7.289,
-    "max_frame_delta": 12.42,
-    "median_frame_delta": 7.617,
-    "std_frame_delta": 2.575
+    "mean_frame_delta": 7.115,
+    "max_frame_delta": 20.05,
+    "median_frame_delta": 6.625,
+    "std_frame_delta": 2.914
   }
 }
