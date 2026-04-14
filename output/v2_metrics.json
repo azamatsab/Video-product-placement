@@ -1,0 +1,28 @@
+{
+  "v1_warped": {
+    "stability": {
+      "mean": 3.193,
+      "median": 3.214,
+      "max": 8.411,
+      "std": 1.287
+    },
+    "label": {
+      "detected": "",
+      "match_ratio": 0.0,
+      "chars_detected": 0
+    }
+  },
+  "v2_composite": {
+    "stability": {
+      "mean": 5.966,
+      "median": 6.48,
+      "max": 10.545,
+      "std": 2.917
+    },
+    "label": {
+      "detected": "HYPNOTIC POISON UUSLCRETE DIOR",
+      "match_ratio": 0.68,
+      "chars_detected": 27
+    }
+  }
+}

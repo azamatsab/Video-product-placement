@@ -1,4 +1,21 @@
-# Video Product Placement — Temporal-Stable Inpainting MVP
+# Video Product Placement — Temporal-Stable Inpainting MVP (v1) + Label-Preserving Composite (v2)
+
+![v1 vs v2 side by side](output/v1_vs_v2_still.jpg)
+
+**v2** is the architecture pivot: when you need to preserve the exact brand
+label on the product (which is every real VPP contract), you **cannot**
+generate the product with diffusion — SDXL, Flux, and every other diffusion
+model produce gibberish for small text. The production answer is to start
+from a **real product photo as a brand asset** and composite it into the
+scene with automatic insertion-surface detection. This repo implements both
+approaches and compares them directly.
+
+Scroll down to [v2 — Label-preserving composite pipeline](#v2--label-preserving-composite-pipeline) for the SAM2 + GroundingDINO flow, or read
+v1 first for the diffusion approach it replaces.
+
+---
+
+# v1 — Diffusion Inpainting MVP
 
 A minimal end-to-end pipeline for **inserting a product into a video clip**
 that demonstrates the core techniques behind production Virtual Product
@@ -311,6 +328,145 @@ In a production pipeline using both together makes sense:
 6. **Swap RAFT for FlowFormer or MemFlow** for slightly better flow on large
    displacements
 
+# v2 — Label-preserving composite pipeline
+
+## Why v1 isn't production-ready
+
+The v1 pipeline generates the product with SDXL Inpainting. This means:
+
+1. **Label text is unreadable.** SDXL can render "a luxury perfume bottle"
+   but it cannot render the exact text `"HYPNOTIC POISON EAU SECRÈTE Dior"`
+   on the bottle. Diffusion models don't have pixel-level text understanding;
+   they produce plausible-looking scribbles instead. For a real brand
+   contract this is a non-starter — the label **is** the product.
+2. **Every new product needs parameter tuning.** The `diff_threshold=100` in
+   v1's tight-mask extraction only works because a dark-glass perfume bottle
+   has high RGB distance from light wood. A white cream tube on a white
+   surface has `diff ≈ 15` and v1 degenerates.
+3. **Hand-coded insertion region.** The ellipse mask position
+   `MASK_BOX = (560, 370, 740, 490)` is hard-coded for one specific scene.
+
+v2 addresses all three.
+
+## Architecture
+
+```
+INPUT:
+  source/frames/*.png            scene frames from v1
+  assets/product_raw.jpg         a real product photo (any catalog asset)
+
+STEP 1  — v2_01_extract_product.py
+  SAM2 with point prompt at image centre → product silhouette
+  → assets/product_rgba.png (alpha-channel PNG, label intact)
+
+STEP 2  — v2_02_detect_table.py
+  GroundingDINO("wooden table.")       → bounding box on frame 0
+  SAM2 with bbox prompt                → precise table mask
+  → assets/table_mask_frame0.png
+  → assets/table_detection_preview.jpg
+
+STEP 3  — v2_03_composite.py
+  Morphological opening with a wide horizontal kernel
+    removes the legs from the table mask, leaving just the top surface
+  Centroid of the cleaned top mask → anchor_x, anchor_y
+  Product resized to 42 % of table top width
+  Per-frame placement via analytic pan+zoom (same transform that built the
+    clip — in a real video we'd use SAM2 video-mode tracking here)
+  Alpha composite + soft drop shadow
+  → output/v2_composite/frames/*.png
+  → output/v2_composite/v2_composite.mp4
+
+STEP 4  — v2_04_eval_and_compare.py
+  Stability metric: mean absolute pixel delta between consecutive frames
+    inside the union product bbox
+  Label readability: easyocr on frame 35, match against ground-truth
+    label via 3- to 5-gram overlap
+  Side-by-side v1 / v2 video
+  → output/v2_metrics.json
+  → output/v1_vs_v2.mp4
+  → output/v1_vs_v2_still.jpg
+```
+
+## Results
+
+| Metric | v1 (SDXL + RAFT) | v2 (SAM2 + composite) | Winner |
+|---|---|---|---|
+| **Label readability (OCR)** | `""` / 0 chars / **0 %** match | `"HYPNOTIC POISON UUSLCRETE DIOR"` / 27 chars / **68 %** match | **v2** (huge) |
+| Stability mean Δ | **3.19** | 5.97 | v1 |
+| Stability median Δ | **3.21** | 6.48 | v1 |
+| Stability max Δ | **8.41** | 10.55 | v1 |
+| Visual identity across frames | the bottle morphs subtly | **pixel-perfect** (same PNG every frame) | **v2** |
+
+### Two Goodhart's-law moments in one repo
+
+**v1 (PuLID)**: ArcFace metric rewards mode-averaging identity encoders; the
+best-scoring config produced the worst-looking faces. Fixed by manual visual
+review and parameter cooling.
+
+**v2 (compositing)**: pixel-delta metric rewards smoothness, punishes sharp
+integer-pixel placement. v1's bilinear-warped product has lower delta even
+though v2's product is literally the same PNG every frame — the v1 product
+geometry *changes* but each change is a smooth interpolation, while v2 has
+hard sub-pixel snap transitions at scale/position steps. OCR metric
+(qualitatively meaningful) goes the other way: v1 = 0 %, v2 = 68 %.
+
+The lesson: always pick **multiple metrics along orthogonal axes**. One
+metric never tells the whole story, and a metric that's easy to measure is
+rarely the one that matters most to the business.
+
+## Side-by-side
+
+![v1 vs v2 side by side](output/v1_vs_v2_still.jpg)
+
+- **v1** (left): diffusion-rendered generic glass bottle with illegible
+  label patches. Smooth motion via RAFT warping, but cannot be sold to a
+  real brand.
+- **v2** (right): the actual Dior Hypnotic Poison Eau Secrète photo,
+  pixel-perfect label, auto-placed on the table by GroundingDINO + SAM2,
+  per-frame tracking via the scene's known camera transform.
+
+## What v2 still doesn't do (honest gaps)
+
+1. **Lighting adaptation** — the product was photographed under studio
+   lighting and pasted into the scene's warm natural light without recoloring.
+   A production pipeline would do histogram matching, intrinsic decomposition,
+   or use a small neural relight module.
+2. **Ground-contact shadow** — current shadow is a simple gaussian ellipse.
+   Real pipelines compute a per-frame shadow via scene-aware ray projection
+   or render a fake point light.
+3. **Sub-pixel placement** — `Image.paste` places at integer pixel
+   coordinates, which is why v2's stability metric is worse than v1's.
+   Production fix: use `torchvision.transforms.functional.affine` or
+   `grid_sample` with the fractional position so the product slides
+   continuously.
+4. **Occlusion** — if a hand passes in front of the table, the product will
+   appear in front of the hand. Fix: per-frame SAM2 foreground segmentation
+   and z-order compositing.
+5. **Video-mode tracking** — I'm using the known analytic camera transform
+   to track the anchor across frames. A real video would need SAM2 in video
+   mode (not single-image mode) to propagate the table mask through frames
+   with proper memory / attention.
+6. **Lossy mask shapes** — GroundingDINO + SAM2 gives a polygon mask at a
+   single resolution. For perspective-accurate product placement on curved
+   surfaces we'd need depth + plane fitting.
+
+Each of these is a 1–2 day extension.
+
+## Comparison: v1 vs v2 at a glance
+
+| Axis | v1 | v2 |
+|---|---|---|
+| Generation | SDXL Inpainting | (none — real photo) |
+| Mask for insertion | hand-coded ellipse | GroundingDINO text prompt + SAM2 |
+| Product label | diffusion-rendered (gibberish) | **pixel-perfect** from asset |
+| Generalization to new products | per-product threshold tuning | upload new PNG, done |
+| Generalization to new scenes | rewrite MASK_BOX coords | text prompt `"table surface."` → auto |
+| Temporal method | RAFT optical flow warp | analytic tracking (static camera) |
+| Temporal pixel-delta | lower (smooth) | higher (integer-pixel snap) |
+| OCR label match | 0 % | **68 %** |
+
+---
+
 ## Acknowledgments
 
 - [SDXL Inpainting 0.1](https://huggingface.co/diffusers/stable-diffusion-xl-1.0-inpainting-0.1) — diffusers
@@ -318,5 +474,11 @@ In a production pipeline using both together makes sense:
   from torchvision
 - [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) — Black
   Forest Labs, used for the source still
+- [SAM 2](https://huggingface.co/facebook/sam2.1-hiera-tiny) — Meta, via
+  `transformers.AutoModelForMaskGeneration`
+- [Grounding DINO (tiny)](https://huggingface.co/IDEA-Research/grounding-dino-tiny)
+  — IDEA Research, via `transformers.AutoModelForZeroShotObjectDetection`
+- [easyocr](https://github.com/JaidedAI/EasyOCR) — JaidedAI, for the label
+  readability metric
 - Companion project: https://github.com/azamatsab/avatar (Flux character
   consistency, shares PuLID + ControlNet stack)
