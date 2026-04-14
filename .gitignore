@@ -1,0 +1,16 @@
+# Model weights (7 GB SDXL Inpainting)
+models/
+
+# Generated frame sequences (large — kept only in mp4)
+source/frames/
+source/masks/
+output/naive/frames/
+output/warped/frames/
+
+# Logs and caches
+*.log
+__pycache__/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

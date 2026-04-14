@@ -1,0 +1,14 @@
+{
+  "naive": {
+    "mean_frame_delta": 8.441,
+    "max_frame_delta": 18.889,
+    "median_frame_delta": 8.717,
+    "std_frame_delta": 3.609
+  },
+  "warped": {
+    "mean_frame_delta": 7.289,
+    "max_frame_delta": 12.42,
+    "median_frame_delta": 7.617,
+    "std_frame_delta": 2.575
+  }
+}
